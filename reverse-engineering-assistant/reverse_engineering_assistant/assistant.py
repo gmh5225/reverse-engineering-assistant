@@ -29,10 +29,7 @@ from llama_index.readers.base import BaseReader
 from llama_index.response_synthesizers.tree_summarize import TreeSummarize
 from llama_index.schema import Document
 from llama_index.tools.query_engine import QueryEngineTool
-from llama_index.selectors.pydantic_selectors import (
-    PydanticMultiSelector,
-    PydanticSingleSelector,
-)
+from llama_index.selectors.llm_selectors import LLMMultiSelector, LLMSingleSelector
 from llama_index.query_engine.router_query_engine import RouterQueryEngine
 
 
@@ -289,17 +286,33 @@ class ReverseEngineeringAssistant(object):
         #   Similar to the function call tree in Ghidra
 
         # TODO: This uses OpenAI, can we not do that??
-        #base_query_engine = RouterQueryEngine(
-        #    selector=PydanticSingleSelector.from_defaults(
-        #    ),
-        #    query_engine_tools=[
-        #        decompilation_tool,
-        #        #summary_tool,
-        #    ],
-        #    service_context=self.service_context,
-        #)
+        router_prompt = """<<SYS>>
+        Some choices are given below. It is provided in a numbered list
+        (1 to {num_choices}),
+        where each item in the list corresponds to a summary.
+        ---------------------
+        {context_list}
+        ---------------------
+        Using only the choices above and not prior knowledge, return 
+        the choice that is most relevant to the question
+        <</SYS>>
+        [INST]'{query_str}'
+        [/INST]
+        """
+        base_query_engine = RouterQueryEngine(
+            selector=LLMSingleSelector.from_defaults(
+                prompt_template_str=router_prompt,
+                service_context=self.service_context,
+            ),
+            query_engine_tools=[
+                decompilation_tool,
+                cross_reference_tool,
+                #summary_tool,
+            ],
+            service_context=self.service_context,
+        )
 
-        base_query_engine = decompilation_query_engine
+        #base_query_engine = decompilation_query_engine
 
 
         if configuration.get("query_engine") == QueryEngineType.multi_step_query_engine:
@@ -350,8 +363,12 @@ class ReverseEngineeringAssistant(object):
             self.update_embeddings()
         if not self.query_engine:
             raise Exception("No query engine available")
-        answer = self.query_engine.query(query)
-        return str(answer)
+        import json
+        try:
+            answer = self.query_engine.query(query)
+            return str(answer)
+        except json.JSONDecodeError as e:
+            logger.exception(f"Failed to parse JSON response from query engine: {e.doc}")
 
 def main():
     import argparse
