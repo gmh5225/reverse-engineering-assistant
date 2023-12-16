@@ -9,6 +9,15 @@ from llama_index.agent.react.formatter import ReActChatFormatter
 from llama_index.callbacks.base_handler import BaseCallbackHandler
 from llama_index.callbacks.schema import CBEventType, EventPayload
 
+from llama_index.agent.react.types import (
+    ActionReasoningStep,
+    BaseReasoningStep,
+    ResponseReasoningStep,
+)
+
+from rich.json import JSON
+import json
+
 import logging
 
 logger = logging.getLogger('reverse_engineering_assistant.llama_index_overrides')
@@ -39,38 +48,91 @@ class RevaSelectionOutputParser(SelectionOutputParser):
         return template
     
 class RevaReActChatFormatter(ReActChatFormatter):
-    pass
+    system_header = """
+You are designed to help with a variety of reverse engineering tasks, from answering questions \
+to providing summaries to other types of analyses.
 
+## Tools
+You have access to a wide variety of tools. You are responsible for using
+the tools in any sequence you deem appropriate to complete the task at hand.
+This may require breaking the task into subtasks and using different tools
+to complete each subtask.
+
+You have access to the following tools:
+{tool_desc}
+
+## Output Format
+To answer the question, please output a JSON object with the following keys:
+- `thought`: a string representing your thought process
+- `action`: a string containing only the tool name (one of {tool_names}) if using a tool.
+- `action_input`: a valid JSON object representing the kwargs (e.g. {{"input": "hello world", "num_beams": 5}})
+
+You should keep repeating the above format until you have enough information
+to answer the question without using any more tools. At that point, you MUST respond
+with a JSON object like so:
+
+- `thought`: "I can answer without using any more tools."
+- `answer`: [your answer here as a string]
+
+- `thought`: "I cannot answer the question with the provided tools."
+- `answer`: "Sorry, I cannot answer your query."
+
+ONLY OUTPUT VALID JSON. If you do not, the system will not be able to parse your output.
+"""
 
 class RevaReActOutputParser(ReActOutputParser):
+    logger: logging.Logger = logging.Logger('reverse_engineering_assistant.RevaReActOutputParser')
+
     def parse(self, output: str, is_streaming: bool = False) -> BaseReasoningStep:
         """ We need to fix the output from the LLM to match the expected outout from the parser.
         The parser is very strict.
         """
+        import re
 
         # First examine the output for the action the LLM wants to take
         # and make sure *only* the function name is in the line. We will do this with
         # a regular expression.
         original_output = output
-        import re
+        
+        # The output should be valid JSON
+        try:
+            if '```json' in output:
+                self.logger.debug(f"Found ```json` in output, cleaning it up")
+                cleaned_output = ''
+                found = False
+                for line in output.splitlines():
+                    if line.strip() == '```':
+                        break
+                    if line.strip() == '```json':
+                        found = True
+                    elif found:
+                        cleaned_output += line + '\n'
+                output = cleaned_output
 
-        if 'Thought:' in output:
-            thought = re.search(r'Thought: (.*?)(Action:|Answer:)', output, re.DOTALL).group(1).strip()
+            if output.startswith('```json') and output.endswith('```'):
+                output = "\n".join(output.splitlines()[1:-1])
+            json_response = json.loads(output)
+            self.logger.debug(f"JSON response: {json_response}")
+            action = json_response.get('action')
+            action_input = json_response.get('action_input')
+            thought = json_response.get('thought')
+            answer = json_response.get('answer')
+            # Now format it as a string again
+            if action and action_input and thought:
+                return ActionReasoningStep(
+                    thought=thought, action=action, action_input=action_input
+                )
+                
+            if thought and answer:
+                return ResponseReasoningStep(
+                    thought=thought, response=answer, is_streaming=is_streaming
+                )
             
-            assert thought
+            raise ValueError(f"Output from LLM is missing keys: {output}")
 
-            if 'Action:' in output:
-                action = re.search(r'Action: ([a-zA-Z_0-9]+).*?Action Input:', output, re.DOTALL).group(1).strip()
-                action_input = re.search(r'Action Input: (\{.*?\})', output, re.DOTALL).group(1).strip()
-
-                # If the LLM chooses to take an action, we will clean it's output.
-                assert action_input.startswith('{') and action_input.endswith('}'), f"Action input is not a JSON object: {action_input}"    
-                output = f"Thought: {thought}\nAction: {action}\nAction Input: {action_input}\n"            
-
-            # Now we have cleaned the output, we will pass it to the parser
-            if output != original_output:
-                logger.debug(f"Replaced output from LLM: {original_output} with {output}")
-        return super().parse(output, is_streaming)
+        except json.JSONDecodeError:
+            self.logger.exception(f"Output from LLM is not valid JSON: {output}")
+            raise ValueError(f"Output from LLM is not valid JSON: {output}")
 
 class RevaLLMLog(BaseCallbackHandler):
     """Callback handler for printing llms inputs/outputs."""
